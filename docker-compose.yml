@@ -1,0 +1,60 @@
+# Production-like stack: Postgres + one-shot migrate/seed + API (code baked into the image).
+#   docker compose up -d --build        start everything
+#   docker compose logs -f api          follow the API logs
+#   docker compose down                 stop (add -v to wipe the database)
+# For development with live reload use docker-compose.dev.yml instead.
+
+name: pure-erp
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pure}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pure}
+      POSTGRES_DB: ${POSTGRES_DB:-pure_erp}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5434}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  # Applies migrations, then seeds the company, businesses, roles, pipeline stages and
+  # (when SEED_ADMIN_EMAIL/SEED_ADMIN_PASSWORD are set in .env) the first admin. Safe to rerun.
+  migrate:
+    build:
+      context: .
+      target: prod
+    command: ["sh", "-c", "app database upgrade --no-prompt && app seed"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pure}:${POSTGRES_PASSWORD:-pure}@db:5432/${POSTGRES_DB:-pure_erp}
+      DATABASE_POOL_DISABLED: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      target: prod
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pure}:${POSTGRES_PASSWORD:-pure}@db:5432/${POSTGRES_DB:-pure_erp}
+    ports:
+      - "${API_HOST_PORT:-8100}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pg_data:

@@ -1,0 +1,72 @@
+# Development stack: Postgres + one-shot migrate/seed + API with live reload.
+#   docker compose -f docker-compose.dev.yml up -d --build    start everything
+#   docker compose -f docker-compose.dev.yml logs -f api      follow the API logs
+#   docker compose -f docker-compose.dev.yml exec api pytest  run the tests
+#   docker compose -f docker-compose.dev.yml down             stop (add -v to wipe the database)
+#
+# Differences from docker-compose.yml: the `dev` image (has pytest/ruff), ./src and ./tests
+# are mounted, and the API restarts when you save a file. Same database volume as prod.
+
+name: pure-erp
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pure}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pure}
+      POSTGRES_DB: ${POSTGRES_DB:-pure_erp}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5434}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  # Applies migrations, then seeds the company, businesses, roles, pipeline stages and
+  # (when SEED_ADMIN_EMAIL/SEED_ADMIN_PASSWORD are set in .env) the first admin. Safe to rerun.
+  migrate:
+    image: pure-erp-api:dev
+    build:
+      context: .
+      target: dev
+    command: ["sh", "-c", "app database upgrade --no-prompt && app seed"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pure}:${POSTGRES_PASSWORD:-pure}@db:5432/${POSTGRES_DB:-pure_erp}
+      DATABASE_POOL_DISABLED: "true"
+    volumes:
+      - ./src:/app/src
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    image: pure-erp-api:dev
+    build:
+      context: .
+      target: dev
+    command: ["app", "run", "--reload", "--host", "0.0.0.0", "--port", "8000"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pure}:${POSTGRES_PASSWORD:-pure}@db:5432/${POSTGRES_DB:-pure_erp}
+      LITESTAR_DEBUG: "true"
+    ports:
+      - "${API_HOST_PORT:-8100}:8000"
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pg_data:
