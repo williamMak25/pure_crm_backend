@@ -16,7 +16,7 @@ from sqlalchemy import and_, case, exists, func, or_, select, update
 from app.db import models as m
 from app.domain.accounts.guards import requires_permission
 from app.domain.accounts.schemas import UserSummary
-from app.domain.organization.scope import ListQuery, business_filter, provide_list_query, resolve_business
+from app.domain.organization.scope import ListQuery, company_members, provide_list_query
 from app.domain.projects.schemas import (
     Board,
     BoardCreate,
@@ -79,6 +79,7 @@ class ProjectController(Controller):
         self,
         boards_service: NamedDependency[BoardService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         list_query: NamedDependency[ListQuery],
     ) -> Paginated[Board]:
         """Boards the user can see, newest first. Filter with `business`, `status` and `search` (title)."""
@@ -90,14 +91,11 @@ class ProjectController(Controller):
             stats, stats.c.board_id == m.Board.id
         )
 
-        filters: list[Any] = []
-        if list_query.business:
-            business = await resolve_business(session, current_user, list_query.business)
-            filters.append(m.Board.business_id == business.id)
+        # The selected company's boards: private ones only for their members.
+        filters: list[Any] = [m.Board.business_id == company.id]
         if not current_user.is_superuser:
             is_member = exists().where(m.BoardMember.board_id == m.Board.id, m.BoardMember.user_id == current_user.id)
-            in_business = business_filter(current_user, m.Board.business_id)
-            filters.append(or_(is_member, and_(m.Board.visibility != m.Visibility.PRIVATE, in_business)))
+            filters.append(or_(is_member, m.Board.visibility != m.Visibility.PRIVATE))
         if list_query.search:
             filters.append(m.Board.title.ilike(f"%{_escape(list_query.search)}%", escape="\\"))
         if list_query.status:
@@ -122,11 +120,12 @@ class ProjectController(Controller):
         self,
         boards_service: NamedDependency[BoardService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         data: JSONBody[BoardCreate],
     ) -> Board:
         """New board with the default lists. The creator becomes its admin."""
         session = boards_service.repository.session
-        business = await resolve_business(session, current_user, data.business)
+        business = company
         board = m.Board(
             business_id=business.id, title=data.title, visibility=data.visibility, created_by=current_user.id
         )
@@ -142,10 +141,11 @@ class ProjectController(Controller):
         self,
         boards_service: NamedDependency[BoardService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         board_id: FromPath[UUID],
     ) -> BoardDetail:
         """The board view: lists with their (non-archived) cards, members and what the user may do."""
-        access = await load_access(boards_service, current_user, board_id)
+        access = await load_access(boards_service, current_user, board_id, company)
         return await _board_detail(boards_service, access)
 
     @patch("/boards/{board_id:uuid}", operation_id="UpdateBoard", guards=[can_update])
@@ -153,11 +153,12 @@ class ProjectController(Controller):
         self,
         boards_service: NamedDependency[BoardService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         board_id: FromPath[UUID],
         data: JSONBody[BoardUpdate],
     ) -> BoardDetail:
         """Rename (editors) or change visibility (board admins)."""
-        access = await load_access(boards_service, current_user, board_id)
+        access = await load_access(boards_service, current_user, board_id, company)
         changes = data.to_dict()
         require(access.can_manage if "visibility" in changes else access.can_edit, MANAGE_ONLY)
         for key, value in changes.items():
@@ -170,9 +171,10 @@ class ProjectController(Controller):
         self,
         boards_service: NamedDependency[BoardService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         board_id: FromPath[UUID],
     ) -> None:
-        access = await load_access(boards_service, current_user, board_id)
+        access = await load_access(boards_service, current_user, board_id, company)
         require(access.can_manage, MANAGE_ONLY)
         await boards_service.delete(access.board.id)
 
@@ -182,15 +184,16 @@ class ProjectController(Controller):
         self,
         boards_service: NamedDependency[BoardService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         board_id: FromPath[UUID],
         data: JSONBody[MemberAdd],
     ) -> BoardMember:
         """ "Share Board": add someone by email, full name or id."""
-        access = await load_access(boards_service, current_user, board_id)
+        access = await load_access(boards_service, current_user, board_id, company)
         require(access.can_manage, MANAGE_ONLY)
         session = boards_service.repository.session
         user = await _find_user(session, data.user)
-        if user is None or not user.is_active or not user.can_access_business(access.board.business_id):
+        if user is None or not user.is_active or not (user.is_superuser or user.membership(access.board.business_id)):
             raise ApplicationClientError(f"No active user '{data.user}' works in {access.board.business.name}")
         existing = await session.scalar(
             select(m.BoardMember).where(m.BoardMember.board_id == board_id, m.BoardMember.user_id == user.id)
@@ -201,31 +204,33 @@ class ProjectController(Controller):
         member.user = user
         session.add(member)
         await session.flush()
-        return _member(member)
+        return _member(member, company.id)
 
     @patch("/board-members/{member_id:uuid}", operation_id="UpdateBoardMember", guards=[can_update])
     async def update_member(
         self,
         boards_service: NamedDependency[BoardService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         member_id: FromPath[UUID],
         data: JSONBody[MemberUpdate],
     ) -> BoardMember:
-        member, _ = await _managed_member(boards_service, current_user, member_id)
+        member, _ = await _managed_member(boards_service, current_user, company, member_id)
         if member.access == m.BoardAccess.ADMIN and data.access != m.BoardAccess.ADMIN:
             await _keep_an_admin(boards_service, member)
         member.access = data.access
         await boards_service.repository.session.flush()
-        return _member(member)
+        return _member(member, company.id)
 
     @delete("/board-members/{member_id:uuid}", operation_id="RemoveBoardMember", guards=[can_update])
     async def remove_member(
         self,
         boards_service: NamedDependency[BoardService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         member_id: FromPath[UUID],
     ) -> None:
-        member, _ = await _managed_member(boards_service, current_user, member_id)
+        member, _ = await _managed_member(boards_service, current_user, company, member_id)
         if member.access == m.BoardAccess.ADMIN:
             await _keep_an_admin(boards_service, member)
         await boards_service.repository.session.delete(member)
@@ -236,10 +241,11 @@ class ProjectController(Controller):
         self,
         boards_service: NamedDependency[BoardService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         board_id: FromPath[UUID],
         data: JSONBody[ListCreate],
     ) -> TaskList:
-        access = await load_access(boards_service, current_user, board_id)
+        access = await load_access(boards_service, current_user, board_id, company)
         require(access.can_edit, READ_ONLY)
         session = boards_service.repository.session
         position = await session.scalar(
@@ -255,10 +261,11 @@ class ProjectController(Controller):
         self,
         boards_service: NamedDependency[BoardService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         list_id: FromPath[UUID],
         data: JSONBody[ListUpdate],
     ) -> TaskList:
-        task_list, _ = await _editable_list(boards_service, current_user, list_id)
+        task_list, _ = await _editable_list(boards_service, current_user, company, list_id)
         for key, value in data.to_dict().items():
             setattr(task_list, key, value)
         await boards_service.repository.session.flush()
@@ -269,10 +276,11 @@ class ProjectController(Controller):
         self,
         boards_service: NamedDependency[BoardService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         list_id: FromPath[UUID],
     ) -> None:
         """Deletes the list and every card in it."""
-        task_list, _ = await _editable_list(boards_service, current_user, list_id)
+        task_list, _ = await _editable_list(boards_service, current_user, company, list_id)
         await boards_service.repository.session.delete(task_list)
 
     # ---------- cards ----------
@@ -282,11 +290,12 @@ class ProjectController(Controller):
         boards_service: NamedDependency[BoardService],
         tasks_service: NamedDependency[TaskService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         list_id: FromPath[UUID],
         data: JSONBody[TaskCreate],
     ) -> Task:
         """ "Add a task" at the bottom of a list."""
-        task_list, _ = await _editable_list(boards_service, current_user, list_id)
+        task_list, _ = await _editable_list(boards_service, current_user, company, list_id)
         task = m.Task(
             board_id=task_list.board_id,
             list_id=task_list.id,
@@ -302,9 +311,10 @@ class ProjectController(Controller):
         boards_service: NamedDependency[BoardService],
         tasks_service: NamedDependency[TaskService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         task_id: FromPath[UUID],
     ) -> TaskDetail:
-        task, access = await _visible_task(boards_service, tasks_service, current_user, task_id)
+        task, access = await _visible_task(boards_service, tasks_service, current_user, company, task_id)
         return await _task_detail(tasks_service, task, access)
 
     @patch("/tasks/{task_id:uuid}", operation_id="UpdateTask", guards=[can_update])
@@ -313,11 +323,12 @@ class ProjectController(Controller):
         boards_service: NamedDependency[BoardService],
         tasks_service: NamedDependency[TaskService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         task_id: FromPath[UUID],
         data: JSONBody[TaskUpdate],
     ) -> TaskDetail:
         """Labels, dates, members, cover, description, title, or mark complete."""
-        task, access = await _visible_task(boards_service, tasks_service, current_user, task_id)
+        task, access = await _visible_task(boards_service, tasks_service, current_user, company, task_id)
         require(access.can_edit, READ_ONLY)
         changes = data.to_dict()
         if "completed" in changes:
@@ -339,13 +350,14 @@ class ProjectController(Controller):
         boards_service: NamedDependency[BoardService],
         tasks_service: NamedDependency[TaskService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         task_id: FromPath[UUID],
         data: JSONBody[TaskMove],
     ) -> TaskDetail:
         """Move to another list, on this board or another one you can edit."""
-        task, access = await _visible_task(boards_service, tasks_service, current_user, task_id)
+        task, access = await _visible_task(boards_service, tasks_service, current_user, company, task_id)
         require(access.can_edit, READ_ONLY)
-        target, target_access = await _editable_list(boards_service, current_user, data.list_id)
+        target, target_access = await _editable_list(boards_service, current_user, company, data.list_id)
         session = tasks_service.repository.session
         if isinstance(data.position, int):
             # Drag and drop: renumber the target list with the card at the requested index.
@@ -384,10 +396,11 @@ class ProjectController(Controller):
         boards_service: NamedDependency[BoardService],
         tasks_service: NamedDependency[TaskService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         task_id: FromPath[UUID],
     ) -> Task:
         """ "Copy card": a copy right below the original, with labels, members, dates and checklist."""
-        task, access = await _visible_task(boards_service, tasks_service, current_user, task_id)
+        task, access = await _visible_task(boards_service, tasks_service, current_user, company, task_id)
         require(access.can_edit, READ_ONLY)
         session = tasks_service.repository.session
         await session.execute(
@@ -420,9 +433,10 @@ class ProjectController(Controller):
         boards_service: NamedDependency[BoardService],
         tasks_service: NamedDependency[TaskService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         task_id: FromPath[UUID],
     ) -> None:
-        task, access = await _visible_task(boards_service, tasks_service, current_user, task_id)
+        task, access = await _visible_task(boards_service, tasks_service, current_user, company, task_id)
         require(access.can_edit, READ_ONLY)
         task.archived_at = datetime.now(UTC)
         await tasks_service.update(task)
@@ -434,10 +448,11 @@ class ProjectController(Controller):
         boards_service: NamedDependency[BoardService],
         tasks_service: NamedDependency[TaskService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         task_id: FromPath[UUID],
         data: JSONBody[ChecklistCreate],
     ) -> ChecklistItem:
-        task, access = await _visible_task(boards_service, tasks_service, current_user, task_id)
+        task, access = await _visible_task(boards_service, tasks_service, current_user, company, task_id)
         require(access.can_edit, READ_ONLY)
         item = m.ChecklistItem(task_id=task.id, text=data.text, position=len(task.checklist))
         task.checklist.append(item)
@@ -450,10 +465,11 @@ class ProjectController(Controller):
         boards_service: NamedDependency[BoardService],
         tasks_service: NamedDependency[TaskService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         item_id: FromPath[UUID],
         data: JSONBody[ChecklistUpdate],
     ) -> ChecklistItem:
-        item = await _editable_item(boards_service, tasks_service, current_user, item_id)
+        item = await _editable_item(boards_service, tasks_service, current_user, company, item_id)
         for key, value in data.to_dict().items():
             setattr(item, key, value)
         await tasks_service.repository.session.flush()
@@ -465,9 +481,10 @@ class ProjectController(Controller):
         boards_service: NamedDependency[BoardService],
         tasks_service: NamedDependency[TaskService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         item_id: FromPath[UUID],
     ) -> None:
-        item = await _editable_item(boards_service, tasks_service, current_user, item_id)
+        item = await _editable_item(boards_service, tasks_service, current_user, company, item_id)
         await tasks_service.repository.session.delete(item)
 
     # ---------- comments ----------
@@ -477,9 +494,10 @@ class ProjectController(Controller):
         boards_service: NamedDependency[BoardService],
         tasks_service: NamedDependency[TaskService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         task_id: FromPath[UUID],
     ) -> list[Comment]:
-        task, _ = await _visible_task(boards_service, tasks_service, current_user, task_id)
+        task, _ = await _visible_task(boards_service, tasks_service, current_user, company, task_id)
         comments = await tasks_service.repository.session.scalars(
             select(m.TaskComment).where(m.TaskComment.task_id == task.id).order_by(m.TaskComment.created_at.desc())
         )
@@ -491,11 +509,12 @@ class ProjectController(Controller):
         boards_service: NamedDependency[BoardService],
         tasks_service: NamedDependency[TaskService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         task_id: FromPath[UUID],
         data: JSONBody[CommentCreate],
     ) -> Comment:
         """Anyone who can see the card can comment, including Viewers."""
-        task, _ = await _visible_task(boards_service, tasks_service, current_user, task_id)
+        task, _ = await _visible_task(boards_service, tasks_service, current_user, company, task_id)
         comment = m.TaskComment(task_id=task.id, author_id=current_user.id, body=data.body)
         comment.author = current_user
         session = tasks_service.repository.session
@@ -508,22 +527,19 @@ class ProjectController(Controller):
         self,
         boards_service: NamedDependency[BoardService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         board_id: FromPath[UUID],
         search: Annotated[str | None, QueryParameter(max_length=100)] = None,
     ) -> list[UserSummary]:
-        """People who could be added in "Share Board": active users of the business not yet on the board."""
-        access = await load_access(boards_service, current_user, board_id)
+        """People who could be added in "Share Board": the company's members not yet on the board."""
+        access = await load_access(boards_service, current_user, board_id, company)
         session = boards_service.repository.session
         on_board = {mem.user_id for mem in await _members(session, board_id)}
-        users = (await session.execute(select(m.User).order_by(m.User.name))).scalars().unique()
         term = (search or "").strip().lower()
         return [
-            UserSummary.from_user(u)
-            for u in users
-            if u.id not in on_board
-            and u.is_active
-            and u.can_access_business(access.board.business_id)
-            and (not term or term in u.name.lower() or term in u.email.lower())
+            UserSummary.from_user(u, company.id)
+            for u in await company_members(session, access.board.business_id)
+            if u.id not in on_board and (not term or term in u.name.lower() or term in u.email.lower())
         ]
 
 
@@ -574,8 +590,8 @@ def _board(board: m.Board, *, task_count: int, due: Any, status: m.BoardStatus) 
     )
 
 
-def _member(member: m.BoardMember) -> BoardMember:
-    summary = UserSummary.from_user(member.user)
+def _member(member: m.BoardMember, business_id: UUID) -> BoardMember:
+    summary = UserSummary.from_user(member.user, business_id)
     return BoardMember(
         **{f: getattr(summary, f) for f in UserSummary.__struct_fields__},
         member_id=member.id,
@@ -640,7 +656,7 @@ async def _board_detail(boards: BoardService, access: BoardAccess) -> BoardDetai
     return BoardDetail(
         **{f: getattr(summary, f) for f in Board.__struct_fields__},
         lists=[TaskList(id=tl.id, title=tl.title, position=tl.position, tasks=by_list[tl.id]) for tl in lists],
-        members=[_member(mem) for mem in await _members(session, board.id)],
+        members=[_member(mem, board.business_id) for mem in await _members(session, board.id)],
         can_edit=access.can_edit,
         can_manage=access.can_manage,
     )
@@ -659,29 +675,33 @@ async def _bottom(tasks: TaskService, list_id: UUID) -> int:
     )
 
 
-async def _editable_list(boards: BoardService, user: m.User, list_id: UUID) -> tuple[m.TaskList, BoardAccess]:
+async def _editable_list(
+    boards: BoardService, user: m.User, company: m.Business, list_id: UUID
+) -> tuple[m.TaskList, BoardAccess]:
     task_list = await boards.repository.session.get(m.TaskList, list_id)
     if task_list is None:
         raise NotFoundException(detail="List not found")
-    access = await load_access(boards, user, task_list.board_id)
+    access = await load_access(boards, user, task_list.board_id, company)
     require(access.can_edit, READ_ONLY)
     return task_list, access
 
 
 async def _visible_task(
-    boards: BoardService, tasks: TaskService, user: m.User, task_id: UUID
+    boards: BoardService, tasks: TaskService, user: m.User, company: m.Business, task_id: UUID
 ) -> tuple[m.Task, BoardAccess]:
     task = await tasks.get_one_or_none(m.Task.id == task_id)
     if task is None:
         raise NotFoundException(detail="Card not found")
-    return task, await load_access(boards, user, task.board_id)
+    return task, await load_access(boards, user, task.board_id, company)
 
 
-async def _editable_item(boards: BoardService, tasks: TaskService, user: m.User, item_id: UUID) -> m.ChecklistItem:
+async def _editable_item(
+    boards: BoardService, tasks: TaskService, user: m.User, company: m.Business, item_id: UUID
+) -> m.ChecklistItem:
     item = await tasks.repository.session.get(m.ChecklistItem, item_id)
     if item is None:
         raise NotFoundException(detail="Checklist item not found")
-    _, access = await _visible_task(boards, tasks, user, item.task_id)
+    _, access = await _visible_task(boards, tasks, user, company, item.task_id)
     require(access.can_edit, READ_ONLY)
     return item
 
@@ -704,11 +724,13 @@ async def _find_user(session: Any, ref: str) -> m.User | None:
     return (await session.execute(select(m.User).where(condition))).scalars().unique().first()
 
 
-async def _managed_member(boards: BoardService, user: m.User, member_id: UUID) -> tuple[m.BoardMember, BoardAccess]:
+async def _managed_member(
+    boards: BoardService, user: m.User, company: m.Business, member_id: UUID
+) -> tuple[m.BoardMember, BoardAccess]:
     member = await boards.repository.session.get(m.BoardMember, member_id)
     if member is None:
         raise NotFoundException(detail="Member not found")
-    access = await load_access(boards, user, member.board_id)
+    access = await load_access(boards, user, member.board_id, company)
     require(access.can_manage, MANAGE_ONLY)
     return member, access
 

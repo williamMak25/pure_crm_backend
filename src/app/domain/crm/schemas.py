@@ -16,7 +16,6 @@ Name = Annotated[str, msgspec.Meta(min_length=1, max_length=200)]
 Email = Annotated[str, msgspec.Meta(pattern=r"^[^\s@]+@[^\s@]+\.[^\s@]+$", max_length=254)]
 Phone = Annotated[str, msgspec.Meta(max_length=50)]
 Country = Annotated[str, msgspec.Meta(max_length=100)]
-Business = Annotated[str, msgspec.Meta(min_length=1, description="Business id, name or slug")]
 Owner = Annotated[str, msgspec.Meta(min_length=1, description="User id or full name")]
 Color = Annotated[str, msgspec.Meta(pattern=r"^#[0-9A-Fa-f]{6}$")]
 Tag = Annotated[str, msgspec.Meta(min_length=1, max_length=50)]
@@ -59,26 +58,96 @@ class Contact(CamelizedBaseStruct):
 
 class ContactCreate(CamelizedBaseStruct):
     name: Name
-    business: Business
     company: Name | None = None
     email: Email | None = None
     phone: Phone | None = None
     owner: Owner | None = None
     """Defaults to the signed-in user."""
     follow_up_date: dt.date | None = None
-    status: m.ContactStatus = m.ContactStatus.LEAD
+    status: m.ContactStatus = m.ContactStatus.ACTIVE
     notes: str | None = None
 
 
 class ContactUpdate(CamelizedBaseStruct, omit_defaults=True):
     name: Name | msgspec.UnsetType = msgspec.UNSET
-    business: Business | msgspec.UnsetType = msgspec.UNSET
     company: Name | None | msgspec.UnsetType = msgspec.UNSET
     email: Email | None | msgspec.UnsetType = msgspec.UNSET
     phone: Phone | None | msgspec.UnsetType = msgspec.UNSET
     owner: Owner | None | msgspec.UnsetType = msgspec.UNSET
     follow_up_date: dt.date | None | msgspec.UnsetType = msgspec.UNSET
     status: m.ContactStatus | msgspec.UnsetType = msgspec.UNSET
+    notes: str | None | msgspec.UnsetType = msgspec.UNSET
+
+
+# ---------- Leads ----------
+LEAD_INPUT_STATUSES = (m.LeadStatus.OPEN, m.LeadStatus.CONTACTED, m.LeadStatus.NEW, m.LeadStatus.LOST)
+"""Statuses people pick. "In Pipeline" is set by the system once the lead has a deal."""
+
+
+class Lead(CamelizedBaseStruct):
+    """A row in the Leads tab."""
+
+    id: UUID
+    name: str
+    company: str | None
+    email: str | None
+    phone: str | None
+    business: str
+    business_id: UUID
+    owner: str | None
+    owner_id: UUID | None
+    follow_up_date: dt.date | None
+    status: m.LeadStatus
+    notes: str | None
+    deal_id: UUID | None
+    """The pipeline card, once the lead is "In Pipeline"."""
+    stage: str | None
+    """Its pipeline stage."""
+
+    @classmethod
+    def from_model(cls, c: m.Contact, deal: m.Deal | None = None) -> Lead:
+        return cls(
+            id=c.id,
+            name=c.name,
+            company=c.company_name,
+            email=c.email,
+            phone=c.phone,
+            business=c.business.name,
+            business_id=c.business_id,
+            owner=c.owner.name if c.owner else None,
+            owner_id=c.owner_id,
+            follow_up_date=c.follow_up_date,
+            status=c.lead_status or m.LeadStatus.OPEN,
+            notes=c.notes,
+            deal_id=deal.id if deal else None,
+            stage=deal.stage.name if deal else None,
+        )
+
+
+class LeadCreate(CamelizedBaseStruct):
+    """New lead. With status "New" it goes straight into the pipeline's New stage."""
+
+    name: Name
+    company: Name | None = None
+    email: Email | None = None
+    phone: Phone | None = None
+    owner: Owner | None = None
+    """Defaults to the signed-in user."""
+    follow_up_date: dt.date | None = None
+    status: m.LeadStatus = m.LeadStatus.OPEN
+    notes: str | None = None
+
+
+class LeadUpdate(CamelizedBaseStruct, omit_defaults=True):
+    """Setting `status` to "New" sends the lead into the pipeline's New stage."""
+
+    name: Name | msgspec.UnsetType = msgspec.UNSET
+    company: Name | None | msgspec.UnsetType = msgspec.UNSET
+    email: Email | None | msgspec.UnsetType = msgspec.UNSET
+    phone: Phone | None | msgspec.UnsetType = msgspec.UNSET
+    owner: Owner | None | msgspec.UnsetType = msgspec.UNSET
+    follow_up_date: dt.date | None | msgspec.UnsetType = msgspec.UNSET
+    status: m.LeadStatus | msgspec.UnsetType = msgspec.UNSET
     notes: str | None | msgspec.UnsetType = msgspec.UNSET
 
 
@@ -111,7 +180,6 @@ class University(CamelizedBaseStruct):
 
 class UniversityCreate(CamelizedBaseStruct):
     name: Name
-    business: Business
     country: Country | None = None
     email: Email | None = None
     phone: Phone | None = None
@@ -121,7 +189,6 @@ class UniversityCreate(CamelizedBaseStruct):
 
 class UniversityUpdate(CamelizedBaseStruct, omit_defaults=True):
     name: Name | msgspec.UnsetType = msgspec.UNSET
-    business: Business | msgspec.UnsetType = msgspec.UNSET
     country: Country | None | msgspec.UnsetType = msgspec.UNSET
     email: Email | None | msgspec.UnsetType = msgspec.UNSET
     phone: Phone | None | msgspec.UnsetType = msgspec.UNSET
@@ -158,7 +225,6 @@ class Consultant(CamelizedBaseStruct):
 
 class ConsultantCreate(CamelizedBaseStruct):
     name: Name
-    business: Business
     company: Name | None = None
     country: Country | None = None
     email: Email | None = None
@@ -168,7 +234,6 @@ class ConsultantCreate(CamelizedBaseStruct):
 
 class ConsultantUpdate(CamelizedBaseStruct, omit_defaults=True):
     name: Name | msgspec.UnsetType = msgspec.UNSET
-    business: Business | msgspec.UnsetType = msgspec.UNSET
     company: Name | None | msgspec.UnsetType = msgspec.UNSET
     country: Country | None | msgspec.UnsetType = msgspec.UNSET
     email: Email | None | msgspec.UnsetType = msgspec.UNSET
@@ -205,7 +270,7 @@ class Deal(CamelizedBaseStruct):
             date=d.expected_date,
             scheduled=d.scheduled,
             position=d.position,
-            owner=UserSummary.from_user(d.owner) if d.owner else None,
+            owner=UserSummary.from_user(d.owner, d.business_id) if d.owner else None,
         )
 
 
@@ -223,7 +288,6 @@ class PipelineStage(CamelizedBaseStruct):
 
 class StageCreate(CamelizedBaseStruct):
     name: Annotated[str, msgspec.Meta(min_length=1, max_length=100)]
-    business: Business
     color: Color | None = None
 
 
@@ -251,7 +315,7 @@ class DealDetail(Deal):
     social_media_link: str | None
     consultant: Ref | None
     opened_at: dt.datetime
-    universities: list[Ref]
+    university: Ref | None
 
     @classmethod
     def from_model(cls, d: m.Deal) -> DealDetail:  # type: ignore[override]
@@ -266,7 +330,7 @@ class DealDetail(Deal):
             social_media_link=d.social_media_link,
             consultant=Ref(id=d.consultant.id, name=d.consultant.name) if d.consultant else None,
             opened_at=d.opened_at,
-            universities=[Ref(id=u.id, name=u.name) for u in sorted(d.universities, key=lambda u: u.name)],
+            university=Ref(id=d.university.id, name=d.university.name) if d.university else None,
         )
 
 
@@ -290,7 +354,7 @@ class DealCreate(CamelizedBaseStruct):
     """Defaults to the signed-in user."""
     social_media_link: Url | None = None
     consultant_id: UUID | None = None
-    university_ids: list[UUID] = msgspec.field(default_factory=list)
+    university_id: UUID | None = None
 
 
 class DealUpdate(CamelizedBaseStruct, omit_defaults=True):
@@ -312,7 +376,7 @@ class DealUpdate(CamelizedBaseStruct, omit_defaults=True):
     social_media_link: Url | None | msgspec.UnsetType = msgspec.UNSET
     consultant_id: UUID | None | msgspec.UnsetType = msgspec.UNSET
     opened_at: dt.datetime | msgspec.UnsetType = msgspec.UNSET
-    university_ids: list[UUID] | msgspec.UnsetType = msgspec.UNSET
+    university_id: UUID | None | msgspec.UnsetType = msgspec.UNSET
 
 
 # ---------- Deal timeline ----------

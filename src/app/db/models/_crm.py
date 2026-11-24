@@ -5,19 +5,17 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from advanced_alchemy.base import UUIDv7AuditBase, orm_registry
+from advanced_alchemy.base import UUIDv7AuditBase
 from advanced_alchemy.types import DateTimeUTC
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
-    Column,
     Date,
     ForeignKey,
     Index,
     Integer,
     SmallInteger,
     String,
-    Table,
     Text,
     func,
 )
@@ -25,27 +23,27 @@ from sqlalchemy.dialects.postgresql import ARRAY, CITEXT
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.models._base import BusinessScopedMixin, Money
-from app.db.models._enums import ActivityKind, ContactStatus, DealMessageKind, RecordStatus, pg_enum
+from app.db.models._enums import (
+    ActivityKind,
+    ContactKind,
+    ContactStatus,
+    DealMessageKind,
+    LeadStatus,
+    RecordStatus,
+    pg_enum,
+)
 
 if TYPE_CHECKING:
     from app.db.models._accounts import User
 
 
-deal_university = Table(
-    "deal_university",
-    orm_registry.metadata,
-    Column("deal_id", ForeignKey("deal.id", ondelete="CASCADE"), primary_key=True),
-    Column("university_id", ForeignKey("university.id", ondelete="CASCADE"), primary_key=True),
-)
-"""Pipeline detail → "Selected Universities"."""
-
-
 class Contact(BusinessScopedMixin, UUIDv7AuditBase):
-    """Customers and leads. Also the customer on quotations, orders and invoices."""
+    """Students (Contact List) and leads (Leads tab). Also the customer on quotations, orders and invoices."""
 
     __tablename__ = "contact"
     __table_args__ = (
         Index("ix_contact_business_status", "business_id", "status"),
+        Index("ix_contact_business_kind", "business_id", "kind"),
         Index("ix_contact_name_trgm", "name", postgresql_using="gin", postgresql_ops={"name": "gin_trgm_ops"}),
     )
 
@@ -60,8 +58,16 @@ class Contact(BusinessScopedMixin, UUIDv7AuditBase):
     follow_up_date: Mapped[date | None] = mapped_column(Date, default=None)
     notes: Mapped[str | None] = mapped_column(Text, default=None)
     status: Mapped[ContactStatus] = mapped_column(
-        pg_enum(ContactStatus, "contact_status"), default=ContactStatus.LEAD, server_default=ContactStatus.LEAD.value
+        pg_enum(ContactStatus, "contact_status"),
+        default=ContactStatus.ACTIVE,
+        server_default=ContactStatus.ACTIVE.value,
     )
+    """Student status (Contact List)."""
+    kind: Mapped[ContactKind] = mapped_column(
+        pg_enum(ContactKind, "contact_kind"), default=ContactKind.STUDENT, server_default=ContactKind.STUDENT.value
+    )
+    lead_status: Mapped[LeadStatus | None] = mapped_column(pg_enum(LeadStatus, "lead_status"), default=None)
+    """Leads only. "In Pipeline" once it has a deal on the pipeline."""
 
     owner: Mapped[User | None] = relationship(lazy="joined")
 
@@ -101,6 +107,9 @@ class Deal(BusinessScopedMixin, UUIDv7AuditBase):
     consultant_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("consultant.id", ondelete="SET NULL"), index=True, default=None
     )
+    university_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("university.id", ondelete="SET NULL"), index=True, default=None
+    )
     """"Consultant By" on the pipeline detail."""
     social_media_link: Mapped[str | None] = mapped_column(String(300), default=None)
     opened_at: Mapped[datetime] = mapped_column(
@@ -113,7 +122,8 @@ class Deal(BusinessScopedMixin, UUIDv7AuditBase):
     """The "Saleperson"."""
     consultant: Mapped[Consultant | None] = relationship(lazy="joined")
     stage: Mapped[PipelineStage] = relationship(lazy="joined", innerjoin=True)
-    universities: Mapped[list[University]] = relationship(secondary=deal_university, lazy="selectin")
+    university: Mapped[University | None] = relationship(lazy="joined")
+    """The one university picked for this lead (pipeline detail → University)."""
 
 
 class DealMessage(UUIDv7AuditBase):

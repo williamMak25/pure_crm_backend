@@ -1,4 +1,4 @@
-from app.db.models._accounts import ActivityLog, RefreshToken, Role, RolePermission, User, user_business
+from app.db.models._accounts import ActivityLog, Membership, RefreshToken, Role, RolePermission, User, user_business
 from app.db.models._crm import (
     Consultant,
     Contact,
@@ -7,7 +7,6 @@ from app.db.models._crm import (
     DealMessage,
     PipelineStage,
     University,
-    deal_university,
 )
 from app.db.models._enums import (
     AccountKind,
@@ -18,11 +17,13 @@ from app.db.models._enums import (
     BoardAccess,
     BoardStatus,
     CommentKind,
+    ContactKind,
     ContactStatus,
     DealMessageKind,
     EmployeeStatus,
     EntryType,
     InvoiceStatus,
+    LeadStatus,
     OrderStatus,
     PaymentMethod,
     PaymentStatus,
@@ -51,12 +52,14 @@ from app.db.models._projects import (
 from app.db.models._sales import DocumentSequence, Product, Quotation, QuotationLine, SalesOrder, SalesOrderLine
 
 __all__ = (
+    "ContactKind",
+    "LeadStatus",
+    "Membership",
     "task_member",
     "ActivityKind",
     "DealActivity",
     "DealMessage",
     "DealMessageKind",
-    "deal_university",
     "AccountKind",
     "ActivityLog",
     "AppModule",

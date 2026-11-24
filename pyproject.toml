@@ -1,7 +1,7 @@
 [project]
 name = "pure-erp-api"
 version = "0.1.0"
-description = "Backend API for the PURE Education ERP admin dashboard."
+description = "Backend API for the PURE ERP admin dashboard."
 authors = [{ name = "waiyanwinlwin", email = "waiyanwinlwin25@gmail.com" }]
 requires-python = ">=3.12"
 dependencies = [

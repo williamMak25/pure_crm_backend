@@ -20,11 +20,14 @@ from app.domain.accounts.guards import auth, provide_user
 from app.domain.crm.controllers import (
     ConsultantController,
     ContactController,
+    LeadController,
     PipelineController,
     UniversityController,
 )
 from app.domain.organization.controllers import BusinessController
+from app.domain.organization.scope import provide_company
 from app.domain.projects.controllers import ProjectController
+from app.domain.settings.controllers import SettingsController
 from app.domain.system.controllers import SystemController
 from app.lib.exceptions import exception_handlers
 from app.lib.settings import AppSettings, get_settings, provide_app_settings
@@ -64,10 +67,12 @@ class ApplicationCore(InitPluginProtocol, CLIPluginProtocol):
                 MeController,
                 BusinessController,
                 ContactController,
+                LeadController,
                 UniversityController,
                 ConsultantController,
                 PipelineController,
                 ProjectController,
+                SettingsController,
             ],
         )
         app_config.route_handlers.extend([SystemController, api_router])
@@ -77,6 +82,7 @@ class ApplicationCore(InitPluginProtocol, CLIPluginProtocol):
         app_config.dependencies.update(
             {
                 "current_user": Provide(provide_user, sync_to_thread=False),
+                "company": Provide(provide_company),
                 "settings": Provide(provide_app_settings, sync_to_thread=False),
             }
         )

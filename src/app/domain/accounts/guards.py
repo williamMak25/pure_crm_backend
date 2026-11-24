@@ -13,6 +13,7 @@ from litestar.security.jwt import JWTCookieAuth, Token
 from app.config import alchemy
 from app.db import models as m
 from app.domain.accounts.deps import provide_users_service
+from app.domain.organization.scope import COMPANY_HEADER, member_company
 from app.lib.settings import get_settings
 
 if TYPE_CHECKING:
@@ -59,7 +60,14 @@ def requires_permission(
     """
 
     def guard(connection: ASGIConnection[Any, m.User, Token, Any], _: BaseRouteHandler) -> None:
-        if not connection.user.has_permission(module, action):
+        user = connection.user
+        if user.is_superuser:
+            return
+        # Roles are per company: check the role in the company chosen in the switcher.
+        company = member_company(user, connection.headers.get(COMPANY_HEADER))
+        if company is None:
+            raise PermissionDeniedException(detail="You are not a member of this company")
+        if not user.has_permission(module, action, company.id):
             raise PermissionDeniedException(detail=f"Your role cannot {action.value} in {module.value}")
 
     return guard

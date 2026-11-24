@@ -63,7 +63,7 @@ async def database() -> AsyncIterator[None]:
         await conn.run_sync(orm_registry.metadata.create_all)
     async with alchemy.get_session() as session:
         await _seed(session, ADMIN[0], ADMIN[1], "Test Admin")
-        await _create_user(session, SALES[0], "Test Sales", SALES[1], "Sales", ("pure-education",))
+        await _create_user(session, SALES[0], "Test Sales", SALES[1], "Staff", ("pure-education",))
         await session.commit()
     yield
     await engine.dispose()
@@ -86,9 +86,15 @@ def app() -> Litestar:
     return application
 
 
+def use_company(client: AsyncTestClient[Litestar], company: str) -> None:
+    """Pick a company in the "switcher": later requests are scoped to it."""
+    client.headers["X-Company"] = company
+
+
 @pytest.fixture
 async def client(app: Litestar) -> AsyncIterator[AsyncTestClient[Litestar]]:
     from litestar.testing import AsyncTestClient
 
     async with AsyncTestClient(app=app) as test_client:
+        use_company(test_client, "pure-education")
         yield test_client

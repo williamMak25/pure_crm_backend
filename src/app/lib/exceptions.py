@@ -50,6 +50,13 @@ class ApplicationClientError(ApplicationError):
     detail = "Bad request"
 
 
+class ApplicationConflictError(ApplicationError):
+    """The request clashes with existing data (e.g. deleting something still in use)."""
+
+    status_code = HTTP_409_CONFLICT
+    detail = "Conflict"
+
+
 class AuthorizationError(ApplicationClientError):
     """A user tried to do something they shouldn't have."""
 

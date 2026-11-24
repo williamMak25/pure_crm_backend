@@ -52,7 +52,7 @@ def access_for(user: m.User, board: m.Board, member: m.BoardMember | None) -> Bo
     """
     if user.is_superuser:
         return BoardAccess(board, member, can_edit=True, can_manage=True)
-    if member is None and (board.visibility == m.Visibility.PRIVATE or not user.can_access_business(board.business_id)):
+    if member is None and (board.visibility == m.Visibility.PRIVATE or not user.membership(board.business_id)):
         return None
     is_creator = board.created_by == user.id
     is_admin = member is not None and member.access == m.BoardAccess.ADMIN
@@ -60,15 +60,17 @@ def access_for(user: m.User, board: m.Board, member: m.BoardMember | None) -> Bo
     return BoardAccess(
         board,
         member,
-        can_edit=can_write and user.has_permission(m.AppModule.PROJECTS, m.PermissionAction.UPDATE),
+        can_edit=can_write and user.has_permission(m.AppModule.PROJECTS, m.PermissionAction.UPDATE, board.business_id),
         can_manage=is_creator or is_admin,
     )
 
 
-async def load_access(boards: BoardService, user: m.User, board_id: UUID) -> BoardAccess:
-    """Board plus the user's rights on it. Invisible boards look missing."""
+async def load_access(boards: BoardService, user: m.User, board_id: UUID, company: m.Business) -> BoardAccess:
+    """Board plus the user's rights on it. Boards of other companies, and invisible ones, look missing."""
     session = boards.repository.session
     board = await session.get(m.Board, board_id)
+    if board is not None and board.business_id != company.id:
+        board = None
     member = None
     if board is not None:
         member = await session.scalar(

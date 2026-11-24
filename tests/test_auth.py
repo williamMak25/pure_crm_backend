@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from tests.conftest import ADMIN, SALES
+from tests.conftest import ADMIN, SALES, use_company
 
 if TYPE_CHECKING:
     from litestar import Litestar
@@ -83,6 +83,21 @@ async def test_businesses_follow_membership(client: AsyncTestClient[Litestar]) -
     client.cookies.clear()
     await login(client, SALES)
     assert [b["name"] for b in (await client.get("/api/businesses")).json()] == ["PURE Education"]
+
+
+async def test_me_follows_the_selected_company(client: AsyncTestClient[Litestar]) -> None:
+    await login(client, ADMIN)
+    use_company(client, "GPM")
+    me = (await client.get("/api/me")).json()
+    assert me["company"] == "GPM" and me["role"] == "Super Admin"
+
+    client.cookies.clear()
+    await login(client, SALES)
+    use_company(client, "PURE Education")
+    me = (await client.get("/api/me")).json()
+    assert me["company"] == "PURE Education" and me["role"] == "Staff" and "crm" in me["permissions"]
+    use_company(client, "GPM")  # not a member there
+    assert (await client.get("/api/crm/contacts")).status_code == 403
 
 
 async def test_permission_guard(client: AsyncTestClient[Litestar]) -> None:

@@ -6,7 +6,7 @@ from uuid import UUID
 
 from advanced_alchemy.base import UUIDv7AuditBase, orm_registry
 from advanced_alchemy.types import DateTimeUTC
-from sqlalchemy import Boolean, Column, ForeignKey, String, Table, Text, UniqueConstraint
+from sqlalchemy import Boolean, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ARRAY, CITEXT, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -15,27 +15,39 @@ from app.db.models._enums import AppModule, PermissionAction, RecordStatus, pg_e
 if TYPE_CHECKING:
     from app.db.models._organization import Business
 
-user_business = Table(
-    "user_business",
-    orm_registry.metadata,
-    Column("user_id", ForeignKey("user_account.id", ondelete="CASCADE"), primary_key=True),
-    Column("business_id", ForeignKey("business.id", ondelete="CASCADE"), primary_key=True),
-)
-"""Which business units a user can switch to."""
+
+class Membership(orm_registry.generate_base()):  # type: ignore[misc]
+    """A user's place in one company (a `business` row): which companies they can switch to,
+    and their role there. Roles are per company, so permissions change with the switcher."""
+
+    __tablename__ = "user_business"
+
+    user_id: Mapped[UUID] = mapped_column(ForeignKey("user_account.id", ondelete="CASCADE"), primary_key=True)
+    business_id: Mapped[UUID] = mapped_column(ForeignKey("business.id", ondelete="CASCADE"), primary_key=True)
+    role_id: Mapped[UUID | None] = mapped_column(ForeignKey("role.id", ondelete="SET NULL"), index=True, default=None)
+
+    role: Mapped[Role | None] = relationship(lazy="selectin")
+    business: Mapped[Business] = relationship(lazy="selectin")
+
+
+user_business = Membership.__table__
 
 
 class Role(UUIDv7AuditBase):
-    __tablename__ = "role"
+    """A role in one company. Each company has its own list and permission matrix."""
 
-    name: Mapped[str] = mapped_column(String(100), unique=True)
+    __tablename__ = "role"
+    __table_args__ = (UniqueConstraint("business_id", "name", name="uq_role_business_name"),)
+
+    business_id: Mapped[UUID] = mapped_column(ForeignKey("business.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(100))
     description: Mapped[str | None] = mapped_column(Text, default=None)
     is_system: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
-    """System roles (Admin) cannot be deleted from the UI."""
+    """The Super Admin role: full access, can't be edited."""
 
     permissions: Mapped[list[RolePermission]] = relationship(
         back_populates="role", lazy="selectin", cascade="all, delete-orphan"
     )
-    users: Mapped[list[User]] = relationship(back_populates="role", lazy="raise")
 
 
 class RolePermission(UUIDv7AuditBase):
@@ -66,12 +78,19 @@ class User(UUIDv7AuditBase):
         pg_enum(RecordStatus, "record_status"), default=RecordStatus.ACTIVE, server_default=RecordStatus.ACTIVE.value
     )
     is_superuser: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
-    """Bypasses permission checks and business membership. Seeded admin only."""
-    role_id: Mapped[UUID | None] = mapped_column(ForeignKey("role.id", ondelete="SET NULL"), index=True, default=None)
+    """Bypasses permission checks and company membership. Seeded admin only."""
     last_active_at: Mapped[datetime | None] = mapped_column(DateTimeUTC(timezone=True), default=None)
+    default_business_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("business.id", ondelete="SET NULL"), default=None
+    )
+    """Company the switcher starts on when the browser hasn't remembered one."""
 
-    role: Mapped[Role | None] = relationship(back_populates="users", lazy="selectin")
-    businesses: Mapped[list[Business]] = relationship(secondary=user_business, lazy="selectin")
+    memberships: Mapped[list[Membership]] = relationship(lazy="selectin", cascade="all, delete-orphan")
+    businesses: Mapped[list[Business]] = relationship(
+        secondary="user_business", lazy="selectin", viewonly=True, order_by="Business.name"
+    )
+    """Companies the user belongs to (read-only view of `memberships`)."""
+    default_business: Mapped[Business | None] = relationship(lazy="selectin", foreign_keys=[default_business_id])
     refresh_tokens: Mapped[list[RefreshToken]] = relationship(
         back_populates="user", lazy="raise", cascade="all, delete-orphan"
     )
@@ -80,16 +99,26 @@ class User(UUIDv7AuditBase):
     def is_active(self) -> bool:
         return self.status == RecordStatus.ACTIVE
 
-    @property
-    def permission_set(self) -> set[tuple[str, str]]:
-        if self.role is None:
-            return set()
-        return {(p.module.value, p.action.value) for p in self.role.permissions}
+    def membership(self, business_id: UUID | None) -> Membership | None:
+        return next((ms for ms in self.memberships if ms.business_id == business_id), None)
 
-    def has_permission(self, module: AppModule | str, action: PermissionAction | str) -> bool:
+    def role_in(self, business_id: UUID | None) -> Role | None:
+        ms = self.membership(business_id)
+        return ms.role if ms else None
+
+    def role_name(self, business_id: UUID | None) -> str:
+        role = self.role_in(business_id)
+        return role.name if role else ("Super Admin" if self.is_superuser else "No role")
+
+    def permission_set(self, business_id: UUID | None) -> set[tuple[str, str]]:
+        role = self.role_in(business_id)
+        return {(p.module.value, p.action.value) for p in role.permissions} if role else set()
+
+    def has_permission(self, module: AppModule | str, action: PermissionAction | str, business_id: UUID | None) -> bool:
+        """Permission in one company. Super admins can do everything everywhere."""
         if self.is_superuser:
             return True
-        return (str(module), str(action)) in self.permission_set
+        return (str(module), str(action)) in self.permission_set(business_id)
 
     def can_access_business(self, business_id: UUID) -> bool:
         return self.is_superuser or any(b.id == business_id for b in self.businesses)

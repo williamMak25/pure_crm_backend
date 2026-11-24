@@ -33,8 +33,9 @@ class Board(CamelizedBaseStruct):
 
 
 class BoardCreate(CamelizedBaseStruct):
+    """New board in the selected company."""
+
     title: Title
-    business: Annotated[str, msgspec.Meta(min_length=1, description="Business id, name or slug")]
     visibility: m.Visibility = m.Visibility.WORKSPACE
 
 

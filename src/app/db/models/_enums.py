@@ -29,10 +29,28 @@ class RecordStatus(StrEnum):
 
 
 class ContactStatus(StrEnum):
-    LEAD = "Lead"
+    """Status of a student contact (Contact List). The database type still holds an unused "Lead" value."""
+
     ACTIVE = "Active"
     INACTIVE = "Inactive"
     ARCHIVED = "Archived"
+
+
+class ContactKind(StrEnum):
+    """Contact List (students) or the Leads tab."""
+
+    STUDENT = "student"
+    LEAD = "lead"
+
+
+class LeadStatus(StrEnum):
+    """Leads tab. Setting "New" sends the lead to the pipeline, after which it reads "In Pipeline"."""
+
+    OPEN = "Open"
+    CONTACTED = "Contacted"
+    NEW = "New"
+    IN_PIPELINE = "In Pipeline"
+    LOST = "Lost"
 
 
 class DealMessageKind(StrEnum):

@@ -9,7 +9,7 @@ from app.domain.accounts.services import RefreshTokenService, RoleService, UserS
 provide_users_service = create_service_provider(
     UserService,
     load=[
-        selectinload(m.User.role).selectinload(m.Role.permissions),
+        selectinload(m.User.memberships).selectinload(m.Membership.role).selectinload(m.Role.permissions),
         selectinload(m.User.businesses),
     ],
     uniquify=True,

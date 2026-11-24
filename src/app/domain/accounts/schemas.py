@@ -28,6 +28,9 @@ class CurrentUser(CamelizedBaseStruct):
     phones: list[str] = msgspec.field(default_factory=list)
     is_superuser: bool = False
     permissions: dict[str, list[str]] = msgspec.field(default_factory=dict)
+    """Allowed actions per module in `company` (roles are per company)."""
+    company: str | None = None
+    """The company these permissions apply to (the switcher's selection)."""
 
 
 class UserSummary(CamelizedBaseStruct):
@@ -40,11 +43,12 @@ class UserSummary(CamelizedBaseStruct):
     email: str | None = None
 
     @classmethod
-    def from_user(cls, user: m.User) -> UserSummary:
+    def from_user(cls, user: m.User, business_id: UUID | None = None) -> UserSummary:
+        """`role` is the user's role in that company (roles are per company)."""
         return cls(
             id=user.id,
             name=user.name,
-            role=user.role.name if user.role else ("Admin" if user.is_superuser else "No role"),
+            role=user.role_name(business_id),
             avatar=user.avatar_url,
             email=user.email,
         )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from tests.conftest import ADMIN, SALES
+from tests.conftest import ADMIN, SALES, use_company
 from tests.test_auth import login
 from tests.test_crm import unique
 
@@ -12,9 +12,7 @@ if TYPE_CHECKING:
 
 
 async def make_board(client: AsyncTestClient[Litestar], **extra: str) -> dict:
-    created = await client.post(
-        "/api/projects/boards", json={"title": unique("Website Redesign"), "business": "PURE Education", **extra}
-    )
+    created = await client.post("/api/projects/boards", json={"title": unique("Website Redesign"), **extra})
     assert created.status_code == 201, created.text
     return (await client.get(f"/api/projects/boards/{created.json()['id']}")).json()
 
@@ -120,9 +118,7 @@ async def test_board_sharing_and_access(client: AsyncTestClient[Litestar]) -> No
     await client.post("/api/auth/logout")
 
     await login(client, SALES)
-    assert (
-        await client.post("/api/projects/boards", json={"title": "X", "business": "PURE Education"})
-    ).status_code == 403
+    assert (await client.post("/api/projects/boards", json={"title": "X"})).status_code == 403
     assert (await client.get(f"/api/projects/boards/{secret['id']}")).status_code == 404
     view = (await client.get(f"/api/projects/boards/{board['id']}")).json()
     assert view["canEdit"] is False and view["canManage"] is False
@@ -144,3 +140,16 @@ async def test_board_sharing_and_access(client: AsyncTestClient[Litestar]) -> No
     edited = await client.patch(f"/api/projects/tasks/{card['id']}", json={"title": "Plan v2"})
     assert edited.status_code == 200 and edited.json()["title"] == "Plan v2"
     assert (await client.patch(f"/api/projects/boards/{board['id']}", json={"visibility": "public"})).status_code == 403
+
+
+async def test_boards_stay_in_their_company(client: AsyncTestClient[Litestar]) -> None:
+    await login(client, ADMIN)
+    board = await make_board(client)
+    assert board["business"] == "PURE Education"
+    use_company(client, "GPM")
+    listed = {b["id"] for b in (await client.get("/api/projects/boards", params={"pageSize": 100})).json()["items"]}
+    assert board["id"] not in listed
+    assert (await client.get(f"/api/projects/boards/{board['id']}")).status_code == 404
+    assert (
+        await client.post(f"/api/projects/lists/{board['lists'][0]['id']}/tasks", json={"title": "X"})
+    ).status_code == 404

@@ -21,6 +21,7 @@ from app.db import models as m
 from app.domain.accounts.guards import requires_permission
 from app.domain.accounts.schemas import UserSummary
 from app.domain.crm.schemas import (
+    LEAD_INPUT_STATUSES,
     Consultant,
     ConsultantCreate,
     ConsultantUpdate,
@@ -36,6 +37,9 @@ from app.domain.crm.schemas import (
     DealMessage,
     DealMessageCreate,
     DealUpdate,
+    Lead,
+    LeadCreate,
+    LeadUpdate,
     PipelineStage,
     StageCreate,
     StageUpdate,
@@ -61,10 +65,10 @@ from app.domain.crm.services import (
 )
 from app.domain.organization.scope import (
     ListQuery,
+    company_members,
     get_scoped,
     list_scoped,
     provide_list_query,
-    resolve_business,
     resolve_user,
 )
 from app.lib.exceptions import ApplicationClientError
@@ -82,16 +86,10 @@ list_query_dependency = Provide(provide_list_query, sync_to_thread=False)
 
 
 async def apply_changes(
-    item: Any, changes: dict[str, Any], user: m.User, service: Any, renames: dict[str, str] | None = None
+    item: Any, changes: dict[str, Any], service: Any, renames: dict[str, str] | None = None
 ) -> None:
-    """Copy a PATCH body onto a business-scoped row.
-
-    `business` and `owner` arrive as names and are resolved (and access-checked) here.
-    """
+    """Copy a PATCH body onto a company row. `owner` arrives as a name and is resolved here."""
     session = service.repository.session
-    if "business" in changes:
-        business = await resolve_business(session, user, changes.pop("business"))
-        item.business_id, item.business = business.id, business
     if "owner" in changes:
         ref = changes.pop("owner")
         owner = await resolve_user(session, ref, item.business_id) if ref else None
@@ -114,15 +112,17 @@ class ContactController(Controller):
         self,
         contacts_service: NamedDependency[ContactService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         list_query: NamedDependency[ListQuery],
     ) -> Paginated[Contact]:
-        """Contacts in every business the user can see. Filter with `business`, `status` and `search`."""
+        """Students (Contact List). Leads are under /crm/leads. Filter with `status` and `search`."""
         items, total = await list_scoped(
             contacts_service,
-            current_user,
+            company,
             list_query,
             search=[m.Contact.name, m.Contact.company_name, m.Contact.email],
             status_enum=m.ContactStatus,
+            where=[m.Contact.kind == m.ContactKind.STUDENT],
         )
         return page_of([Contact.from_model(c) for c in items], total, list_query)
 
@@ -131,10 +131,11 @@ class ContactController(Controller):
         self,
         contacts_service: NamedDependency[ContactService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         data: JSONBody[ContactCreate],
     ) -> Contact:
         session = contacts_service.repository.session
-        business = await resolve_business(session, current_user, data.business)
+        business = company
         owner = await resolve_user(session, data.owner, business.id) if data.owner else current_user
         contact = m.Contact(
             business_id=business.id,
@@ -155,20 +156,24 @@ class ContactController(Controller):
         self,
         contacts_service: NamedDependency[ContactService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         contact_id: FromPath[UUID],
     ) -> Contact:
-        return Contact.from_model(await get_scoped(contacts_service, current_user, contact_id))
+        return Contact.from_model(
+            await get_scoped(contacts_service, company, contact_id, m.Contact.kind == m.ContactKind.STUDENT)
+        )
 
     @patch("/{contact_id:uuid}", operation_id="UpdateContact", guards=[can_update])
     async def update_contact(
         self,
         contacts_service: NamedDependency[ContactService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         contact_id: FromPath[UUID],
         data: JSONBody[ContactUpdate],
     ) -> Contact:
-        contact = await get_scoped(contacts_service, current_user, contact_id)
-        await apply_changes(contact, data.to_dict(), current_user, contacts_service, {"company": "company_name"})
+        contact = await get_scoped(contacts_service, company, contact_id, m.Contact.kind == m.ContactKind.STUDENT)
+        await apply_changes(contact, data.to_dict(), contacts_service, {"company": "company_name"})
         return Contact.from_model(await contacts_service.update(contact))
 
     @delete("/{contact_id:uuid}", operation_id="DeleteContact", guards=[can_delete])
@@ -176,10 +181,130 @@ class ContactController(Controller):
         self,
         contacts_service: NamedDependency[ContactService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         contact_id: FromPath[UUID],
     ) -> None:
-        contact = await get_scoped(contacts_service, current_user, contact_id)
+        contact = await get_scoped(contacts_service, company, contact_id, m.Contact.kind == m.ContactKind.STUDENT)
         await contacts_service.delete(contact.id)
+
+
+class LeadController(Controller):
+    """The Leads tab. Setting a lead to "New" puts it on the pipeline's New stage ("In Pipeline")."""
+
+    path = "/crm/leads"
+    tags = ["CRM"]
+    dependencies = {
+        "contacts_service": Provide(provide_contact_service),
+        "deals_service": Provide(provide_deal_service),
+        "stages_service": Provide(provide_stage_service),
+        "list_query": list_query_dependency,
+    }
+
+    @get(operation_id="ListLeads", guards=[can_read])
+    async def list_leads(
+        self,
+        contacts_service: NamedDependency[ContactService],
+        deals_service: NamedDependency[DealService],
+        company: NamedDependency[m.Business],
+        list_query: NamedDependency[ListQuery],
+    ) -> Paginated[Lead]:
+        """The company's leads. Filter with `status` (Open, Contacted, New, In Pipeline, Lost) and `search`."""
+        items, total = await list_scoped(
+            contacts_service,
+            company,
+            list_query,
+            search=[m.Contact.name, m.Contact.company_name, m.Contact.email, m.Contact.phone],
+            status_enum=m.LeadStatus,
+            status_column=m.Contact.lead_status,
+            where=[m.Contact.kind == m.ContactKind.LEAD],
+        )
+        deals = await _deals_by_contact(deals_service, [c.id for c in items])
+        return page_of([Lead.from_model(c, deals.get(c.id)) for c in items], total, list_query)
+
+    @post(operation_id="CreateLead", guards=[can_create])
+    async def create_lead(
+        self,
+        contacts_service: NamedDependency[ContactService],
+        deals_service: NamedDependency[DealService],
+        stages_service: NamedDependency[PipelineStageService],
+        current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
+        data: JSONBody[LeadCreate],
+    ) -> Lead:
+        _check_lead_status(data.status)
+        session = contacts_service.repository.session
+        owner = await resolve_user(session, data.owner, company.id) if data.owner else current_user
+        lead = m.Contact(
+            business_id=company.id,
+            owner_id=owner.id,
+            kind=m.ContactKind.LEAD,
+            lead_status=m.LeadStatus.OPEN if data.status == m.LeadStatus.NEW else data.status,
+            name=data.name,
+            company_name=data.company,
+            email=data.email,
+            phone=data.phone,
+            follow_up_date=data.follow_up_date,
+            notes=data.notes,
+        )
+        lead.business, lead.owner = company, owner
+        lead = await contacts_service.create(lead)
+        deal = None
+        if data.status == m.LeadStatus.NEW:
+            deal = await _send_to_pipeline(lead, company, current_user, deals_service, stages_service)
+        return Lead.from_model(lead, deal)
+
+    @get("/{lead_id:uuid}", operation_id="GetLead", guards=[can_read])
+    async def get_lead(
+        self,
+        contacts_service: NamedDependency[ContactService],
+        deals_service: NamedDependency[DealService],
+        company: NamedDependency[m.Business],
+        lead_id: FromPath[UUID],
+    ) -> Lead:
+        lead = await get_scoped(contacts_service, company, lead_id, m.Contact.kind == m.ContactKind.LEAD)
+        return Lead.from_model(lead, (await _deals_by_contact(deals_service, [lead.id])).get(lead.id))
+
+    @patch("/{lead_id:uuid}", operation_id="UpdateLead", guards=[can_update])
+    async def update_lead(
+        self,
+        contacts_service: NamedDependency[ContactService],
+        deals_service: NamedDependency[DealService],
+        stages_service: NamedDependency[PipelineStageService],
+        current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
+        lead_id: FromPath[UUID],
+        data: JSONBody[LeadUpdate],
+    ) -> Lead:
+        """Edit a lead. Changing the status to "New" moves it into the pipeline (once)."""
+        lead = await get_scoped(contacts_service, company, lead_id, m.Contact.kind == m.ContactKind.LEAD)
+        changes = data.to_dict()
+        status = changes.pop("status", None)
+        if status is not None:
+            _check_lead_status(status)
+        await apply_changes(lead, changes, contacts_service, {"company": "company_name"})
+        deal = (await _deals_by_contact(deals_service, [lead.id])).get(lead.id)
+        if status == m.LeadStatus.NEW:
+            if deal is None:
+                deal = await _send_to_pipeline(lead, company, current_user, deals_service, stages_service)
+            lead.lead_status = m.LeadStatus.IN_PIPELINE
+        elif status is not None:
+            lead.lead_status = status
+        lead = await contacts_service.update(lead)
+        return Lead.from_model(lead, deal)
+
+    @delete("/{lead_id:uuid}", operation_id="DeleteLead", guards=[can_delete])
+    async def delete_lead(
+        self,
+        contacts_service: NamedDependency[ContactService],
+        deals_service: NamedDependency[DealService],
+        company: NamedDependency[m.Business],
+        lead_id: FromPath[UUID],
+    ) -> None:
+        """Delete the lead and its pipeline card."""
+        lead = await get_scoped(contacts_service, company, lead_id, m.Contact.kind == m.ContactKind.LEAD)
+        for deal in await deals_service.get_many(m.Deal.contact_id == lead.id):
+            await deals_service.delete(deal.id)
+        await contacts_service.delete(lead.id)
 
 
 class UniversityController(Controller):
@@ -192,11 +317,12 @@ class UniversityController(Controller):
         self,
         universities_service: NamedDependency[UniversityService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         list_query: NamedDependency[ListQuery],
     ) -> Paginated[University]:
         items, total = await list_scoped(
             universities_service,
-            current_user,
+            company,
             list_query,
             search=[m.University.name, m.University.country, m.University.email],
             status_enum=m.RecordStatus,
@@ -208,9 +334,10 @@ class UniversityController(Controller):
         self,
         universities_service: NamedDependency[UniversityService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         data: JSONBody[UniversityCreate],
     ) -> University:
-        business = await resolve_business(universities_service.repository.session, current_user, data.business)
+        business = company
         university = m.University(
             business_id=business.id,
             name=data.name,
@@ -228,20 +355,22 @@ class UniversityController(Controller):
         self,
         universities_service: NamedDependency[UniversityService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         university_id: FromPath[UUID],
     ) -> University:
-        return University.from_model(await get_scoped(universities_service, current_user, university_id))
+        return University.from_model(await get_scoped(universities_service, company, university_id))
 
     @patch("/{university_id:uuid}", operation_id="UpdateUniversity", guards=[can_update])
     async def update_university(
         self,
         universities_service: NamedDependency[UniversityService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         university_id: FromPath[UUID],
         data: JSONBody[UniversityUpdate],
     ) -> University:
-        university = await get_scoped(universities_service, current_user, university_id)
-        await apply_changes(university, data.to_dict(), current_user, universities_service)
+        university = await get_scoped(universities_service, company, university_id)
+        await apply_changes(university, data.to_dict(), universities_service)
         return University.from_model(await universities_service.update(university))
 
     @delete("/{university_id:uuid}", operation_id="DeleteUniversity", guards=[can_delete])
@@ -249,9 +378,10 @@ class UniversityController(Controller):
         self,
         universities_service: NamedDependency[UniversityService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         university_id: FromPath[UUID],
     ) -> None:
-        university = await get_scoped(universities_service, current_user, university_id)
+        university = await get_scoped(universities_service, company, university_id)
         await universities_service.delete(university.id)
 
 
@@ -265,11 +395,12 @@ class ConsultantController(Controller):
         self,
         consultants_service: NamedDependency[ConsultantService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         list_query: NamedDependency[ListQuery],
     ) -> Paginated[Consultant]:
         items, total = await list_scoped(
             consultants_service,
-            current_user,
+            company,
             list_query,
             search=[m.Consultant.name, m.Consultant.company_name, m.Consultant.country, m.Consultant.email],
             status_enum=m.RecordStatus,
@@ -281,9 +412,10 @@ class ConsultantController(Controller):
         self,
         consultants_service: NamedDependency[ConsultantService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         data: JSONBody[ConsultantCreate],
     ) -> Consultant:
-        business = await resolve_business(consultants_service.repository.session, current_user, data.business)
+        business = company
         consultant = m.Consultant(
             business_id=business.id,
             name=data.name,
@@ -301,20 +433,22 @@ class ConsultantController(Controller):
         self,
         consultants_service: NamedDependency[ConsultantService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         consultant_id: FromPath[UUID],
     ) -> Consultant:
-        return Consultant.from_model(await get_scoped(consultants_service, current_user, consultant_id))
+        return Consultant.from_model(await get_scoped(consultants_service, company, consultant_id))
 
     @patch("/{consultant_id:uuid}", operation_id="UpdateConsultant", guards=[can_update])
     async def update_consultant(
         self,
         consultants_service: NamedDependency[ConsultantService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         consultant_id: FromPath[UUID],
         data: JSONBody[ConsultantUpdate],
     ) -> Consultant:
-        consultant = await get_scoped(consultants_service, current_user, consultant_id)
-        await apply_changes(consultant, data.to_dict(), current_user, consultants_service, {"company": "company_name"})
+        consultant = await get_scoped(consultants_service, company, consultant_id)
+        await apply_changes(consultant, data.to_dict(), consultants_service, {"company": "company_name"})
         return Consultant.from_model(await consultants_service.update(consultant))
 
     @delete("/{consultant_id:uuid}", operation_id="DeleteConsultant", guards=[can_delete])
@@ -322,9 +456,10 @@ class ConsultantController(Controller):
         self,
         consultants_service: NamedDependency[ConsultantService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         consultant_id: FromPath[UUID],
     ) -> None:
-        consultant = await get_scoped(consultants_service, current_user, consultant_id)
+        consultant = await get_scoped(consultants_service, company, consultant_id)
         await consultants_service.delete(consultant.id)
 
 
@@ -346,13 +481,11 @@ class PipelineController(Controller):
         self,
         deals_service: NamedDependency[DealService],
         current_user: NamedDependency[m.User],
-        business: Annotated[str, QueryParameter(description="Business id, name or slug")],
+        company: NamedDependency[m.Business],
     ) -> list[UserSummary]:
-        """Active users who work in the business: the Saleperson / Assigned to pickers."""
-        session = deals_service.repository.session
-        found = await resolve_business(session, current_user, business)
-        users = (await session.execute(select(m.User).order_by(m.User.name))).scalars().unique()
-        return [UserSummary.from_user(u) for u in users if u.is_active and u.can_access_business(found.id)]
+        """Active members of the company: the Saleperson / Assigned to pickers."""
+        members = await company_members(deals_service.repository.session, company.id)
+        return [UserSummary.from_user(u, company.id) for u in members]
 
     @get("/pipeline", operation_id="GetPipeline", guards=[can_read])
     async def get_pipeline(
@@ -360,10 +493,10 @@ class PipelineController(Controller):
         stages_service: NamedDependency[PipelineStageService],
         deals_service: NamedDependency[DealService],
         current_user: NamedDependency[m.User],
-        business: Annotated[str, QueryParameter(description="Business id, name or slug")],
+        company: NamedDependency[m.Business],
     ) -> list[PipelineStage]:
-        """Every stage of the business's pipeline, in order, with its deals."""
-        found = await resolve_business(stages_service.repository.session, current_user, business)
+        """Every stage of the company's pipeline, in order, with its deals."""
+        found = company
         order = (OrderBy("position", "asc"), OrderBy("created_at", "asc"))
         stages = await stages_service.get_many(m.PipelineStage.business_id == found.id, *order)
         deals = await deals_service.get_many(m.Deal.business_id == found.id, *order)
@@ -389,9 +522,10 @@ class PipelineController(Controller):
         self,
         stages_service: NamedDependency[PipelineStageService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         data: JSONBody[StageCreate],
     ) -> PipelineStage:
-        business = await resolve_business(stages_service.repository.session, current_user, data.business)
+        business = company
         count = await stages_service.count(m.PipelineStage.business_id == business.id)
         stage = await stages_service.create(
             m.PipelineStage(
@@ -411,10 +545,11 @@ class PipelineController(Controller):
         stages_service: NamedDependency[PipelineStageService],
         deals_service: NamedDependency[DealService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         stage_id: FromPath[UUID],
         data: JSONBody[StageUpdate],
     ) -> PipelineStage:
-        stage = await get_scoped(stages_service, current_user, stage_id)
+        stage = await get_scoped(stages_service, company, stage_id)
         for key, value in data.to_dict().items():
             setattr(stage, key, value)
         stage = await stages_service.update(stage)
@@ -436,9 +571,10 @@ class PipelineController(Controller):
         stages_service: NamedDependency[PipelineStageService],
         deals_service: NamedDependency[DealService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         stage_id: FromPath[UUID],
     ) -> None:
-        stage = await get_scoped(stages_service, current_user, stage_id)
+        stage = await get_scoped(stages_service, company, stage_id)
         if deals := await deals_service.count(m.Deal.stage_id == stage.id):
             raise ClientException(
                 detail=f"Move or delete the {deals} deal(s) in {stage.name} first", status_code=HTTP_409_CONFLICT
@@ -452,16 +588,19 @@ class PipelineController(Controller):
         deals_service: NamedDependency[DealService],
         contacts_service: NamedDependency[ContactService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         stage_id: FromPath[UUID],
         data: JSONBody[DealCreate],
     ) -> Deal:
         """Add a card to a stage, linked to an existing contact or to a new Lead."""
-        stage = await get_scoped(stages_service, current_user, stage_id)
+        stage = await get_scoped(stages_service, company, stage_id)
         session = deals_service.repository.session
         owner = await resolve_user(session, data.owner, stage.business_id) if data.owner else current_user
 
         if data.contact_id:
-            contact = await get_scoped(contacts_service, current_user, data.contact_id)
+            contact = await get_scoped(contacts_service, company, data.contact_id)
+            if contact.kind == m.ContactKind.LEAD:
+                contact.lead_status = m.LeadStatus.IN_PIPELINE
             if contact.business_id != stage.business_id:
                 raise ApplicationClientError("The contact belongs to a different business than the pipeline")
         else:
@@ -472,7 +611,8 @@ class PipelineController(Controller):
                 company_name=data.company,
                 email=data.email,
                 phone=data.phone,
-                status=m.ContactStatus.LEAD,
+                kind=m.ContactKind.LEAD,
+                lead_status=m.LeadStatus.IN_PIPELINE,
             )
             contact.business, contact.owner = stage.business, owner
             contact = await contacts_service.create(contact)
@@ -494,7 +634,8 @@ class PipelineController(Controller):
         deal.business, deal.contact, deal.owner, deal.stage = stage.business, contact, owner, stage
         deal.consultant = await _consultant(session, data.consultant_id, stage.business_id)
         deal.consultant_id = deal.consultant.id if deal.consultant else None
-        deal.universities = await _universities(session, data.university_ids, stage.business_id)
+        deal.university = await _university(session, data.university_id, stage.business_id)
+        deal.university_id = deal.university.id if deal.university else None
         return Deal.from_model(await deals_service.create(deal))
 
     @get("/deals/{deal_id:uuid}", operation_id="GetDeal", guards=[can_read])
@@ -502,10 +643,11 @@ class PipelineController(Controller):
         self,
         deals_service: NamedDependency[DealService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         deal_id: FromPath[UUID],
     ) -> DealDetail:
         """Everything the "Edit Pipeline" dialog shows on its left side."""
-        return DealDetail.from_model(await get_scoped(deals_service, current_user, deal_id))
+        return DealDetail.from_model(await get_scoped(deals_service, company, deal_id))
 
     @patch("/deals/{deal_id:uuid}", operation_id="UpdateDeal", guards=[can_update])
     async def update_deal(
@@ -515,16 +657,17 @@ class PipelineController(Controller):
         contacts_service: NamedDependency[ContactService],
         messages_service: NamedDependency[DealMessageService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         deal_id: FromPath[UUID],
         data: JSONBody[DealUpdate],
     ) -> DealDetail:
         """Edit a card from the "Edit Pipeline" dialog, or move it with `stageId` / `position`."""
-        deal = await get_scoped(deals_service, current_user, deal_id)
+        deal = await get_scoped(deals_service, company, deal_id)
         session = deals_service.repository.session
         changes = data.to_dict()
 
         if "stage_id" in changes and changes["stage_id"] != deal.stage_id:
-            target = await get_scoped(stages_service, current_user, changes["stage_id"])
+            target = await get_scoped(stages_service, company, changes["stage_id"])
             if target.business_id != deal.business_id:
                 raise ApplicationClientError("A deal can only move to a stage in the same business")
             changes.setdefault("position", await _next_position(deals_service, target.id))
@@ -573,10 +716,11 @@ class PipelineController(Controller):
         if "consultant_id" in changes:
             deal.consultant = await _consultant(session, changes.pop("consultant_id"), deal.business_id)
             deal.consultant_id = deal.consultant.id if deal.consultant else None
-        if "university_ids" in changes:
-            deal.universities = await _universities(session, changes.pop("university_ids"), deal.business_id)
+        if "university_id" in changes:
+            deal.university = await _university(session, changes.pop("university_id"), deal.business_id)
+            deal.university_id = deal.university.id if deal.university else None
 
-        await apply_changes(deal, changes, current_user, deals_service, {"date": "expected_date"})
+        await apply_changes(deal, changes, deals_service, {"date": "expected_date"})
         return DealDetail.from_model(await deals_service.update(deal))
 
     @get("/deals/{deal_id:uuid}/messages", operation_id="ListDealMessages", guards=[can_read])
@@ -585,12 +729,13 @@ class PipelineController(Controller):
         deals_service: NamedDependency[DealService],
         messages_service: NamedDependency[DealMessageService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         deal_id: FromPath[UUID],
         kind: FromQuery[m.DealMessageKind | None] = None,
         search: Annotated[str | None, QueryParameter(max_length=100)] = None,
     ) -> list[DealMessage]:
         """The deal's timeline, newest first. `kind=message` for Send Message, `kind=note` for Long Note."""
-        deal = await get_scoped(deals_service, current_user, deal_id)
+        deal = await get_scoped(deals_service, company, deal_id)
         filters: list[Any] = [m.DealMessage.deal_id == deal.id]
         if kind:
             filters.append(m.DealMessage.kind == kind)
@@ -608,11 +753,12 @@ class PipelineController(Controller):
         deals_service: NamedDependency[DealService],
         messages_service: NamedDependency[DealMessageService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         deal_id: FromPath[UUID],
         data: JSONBody[DealMessageCreate],
     ) -> DealMessage:
         """Log a message to the contact or an internal note. Messages are recorded, not emailed."""
-        deal = await get_scoped(deals_service, current_user, deal_id)
+        deal = await get_scoped(deals_service, company, deal_id)
         is_message = data.kind == m.DealMessageKind.MESSAGE
         message = m.DealMessage(
             deal_id=deal.id,
@@ -632,10 +778,11 @@ class PipelineController(Controller):
         deals_service: NamedDependency[DealService],
         activities_service: NamedDependency[DealActivityService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         deal_id: FromPath[UUID],
     ) -> list[DealActivity]:
         """Open activities first (by due date), then done ones."""
-        deal = await get_scoped(deals_service, current_user, deal_id)
+        deal = await get_scoped(deals_service, company, deal_id)
         activities = await activities_service.get_many(m.DealActivity.deal_id == deal.id)
         ordered = sorted(activities, key=lambda a: (a.done_at is not None, a.due_date or dt_date.max, a.created_at))
         return [DealActivity.from_model(a) for a in ordered]
@@ -646,10 +793,11 @@ class PipelineController(Controller):
         deals_service: NamedDependency[DealService],
         activities_service: NamedDependency[DealActivityService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         deal_id: FromPath[UUID],
         data: JSONBody[DealActivityCreate],
     ) -> DealActivity:
-        deal = await get_scoped(deals_service, current_user, deal_id)
+        deal = await get_scoped(deals_service, company, deal_id)
         session = deals_service.repository.session
         assignee = await resolve_user(session, data.assigned_to, deal.business_id) if data.assigned_to else current_user
         activity = m.DealActivity(
@@ -669,11 +817,12 @@ class PipelineController(Controller):
         deals_service: NamedDependency[DealService],
         activities_service: NamedDependency[DealActivityService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         activity_id: FromPath[UUID],
         data: JSONBody[DealActivityUpdate],
     ) -> DealActivity:
         """Edit an activity or mark it done with `{"done": true}`."""
-        activity, deal = await _scoped_activity(activities_service, deals_service, current_user, activity_id)
+        activity, deal = await _scoped_activity(activities_service, deals_service, company, activity_id)
         changes = data.to_dict()
         if "done" in changes:
             activity.done_at = datetime.now(UTC) if changes.pop("done") else None
@@ -691,9 +840,10 @@ class PipelineController(Controller):
         deals_service: NamedDependency[DealService],
         activities_service: NamedDependency[DealActivityService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         activity_id: FromPath[UUID],
     ) -> None:
-        activity, _ = await _scoped_activity(activities_service, deals_service, current_user, activity_id)
+        activity, _ = await _scoped_activity(activities_service, deals_service, company, activity_id)
         await activities_service.delete(activity.id)
 
     @delete("/deals/{deal_id:uuid}", operation_id="DeleteDeal", guards=[can_delete])
@@ -701,11 +851,16 @@ class PipelineController(Controller):
         self,
         deals_service: NamedDependency[DealService],
         current_user: NamedDependency[m.User],
+        company: NamedDependency[m.Business],
         deal_id: FromPath[UUID],
     ) -> None:
-        """Remove the card. The contact stays in Contacts."""
-        deal = await get_scoped(deals_service, current_user, deal_id)
+        """Remove the card. Its lead stays in Leads and goes back to "Open" if it has no other card."""
+        deal = await get_scoped(deals_service, company, deal_id)
+        lead = deal.contact if deal.contact and deal.contact.kind == m.ContactKind.LEAD else None
         await deals_service.delete(deal.id)
+        if lead is not None and not await deals_service.count(m.Deal.contact_id == lead.id):
+            lead.lead_status = m.LeadStatus.OPEN
+            await deals_service.repository.session.flush()
 
 
 async def _next_position(deals_service: DealService, stage_id: UUID) -> int:
@@ -722,21 +877,78 @@ async def _consultant(session: Any, consultant_id: UUID | None, business_id: UUI
     return consultant
 
 
-async def _universities(session: Any, university_ids: list[UUID], business_id: UUID) -> list[m.University]:
-    if not university_ids:
-        return []
-    statement = select(m.University).where(m.University.id.in_(university_ids))
-    found = list((await session.execute(statement)).scalars().unique())
-    if len(found) != len(set(university_ids)) or any(u.business_id != business_id for u in found):
-        raise ApplicationClientError("Pick universities from the same business as the deal")
-    return found
+async def _university(session: Any, university_id: UUID | None, business_id: UUID) -> m.University | None:
+    """The one university picked for a lead; it must belong to the deal's company."""
+    if university_id is None:
+        return None
+    university = await session.get(m.University, university_id)
+    if university is None or university.business_id != business_id:
+        raise ApplicationClientError("Pick a university from this company")
+    return university
 
 
 async def _scoped_activity(
-    activities_service: DealActivityService, deals_service: DealService, user: m.User, activity_id: UUID
+    activities_service: DealActivityService, deals_service: DealService, company: m.Business, activity_id: UUID
 ) -> tuple[m.DealActivity, m.Deal]:
     activity = await activities_service.get_one_or_none(m.DealActivity.id == activity_id)
     if activity is None:
         raise NotFoundException(detail="Activity not found")
-    deal = await get_scoped(deals_service, user, activity.deal_id)
+    deal = await get_scoped(deals_service, company, activity.deal_id)
     return activity, deal
+
+
+def _check_lead_status(status: m.LeadStatus) -> None:
+    if status not in LEAD_INPUT_STATUSES:
+        raise ApplicationClientError('Pick Open, Contacted, New or Lost. "In Pipeline" is set when the lead moves.')
+
+
+async def _deals_by_contact(deals_service: DealService, contact_ids: list[UUID]) -> dict[UUID, m.Deal]:
+    """The (oldest) pipeline card of each contact."""
+    if not contact_ids:
+        return {}
+    deals = await deals_service.get_many(m.Deal.contact_id.in_(contact_ids), OrderBy("created_at", "asc"))
+    found: dict[UUID, m.Deal] = {}
+    for deal in deals:
+        found.setdefault(deal.contact_id, deal)  # type: ignore[arg-type]
+    return found
+
+
+async def _send_to_pipeline(
+    lead: m.Contact,
+    company: m.Business,
+    user: m.User,
+    deals_service: DealService,
+    stages_service: PipelineStageService,
+) -> m.Deal:
+    """Put the lead on the pipeline's "New" stage (or the first stage) and mark it "In Pipeline"."""
+    stages = await stages_service.get_many(
+        m.PipelineStage.business_id == company.id, OrderBy("position", "asc"), OrderBy("created_at", "asc")
+    )
+    if not stages:
+        raise ApplicationClientError("This company's pipeline has no stages yet. Add one on the Pipeline tab first.")
+    stage = next((st for st in stages if st.name.strip().lower() == "new"), stages[0])
+    deal = m.Deal(
+        business_id=company.id,
+        stage_id=stage.id,
+        contact_id=lead.id,
+        owner_id=lead.owner_id or user.id,
+        name=lead.name,
+        tags=[],
+        expected_date=lead.follow_up_date,
+        position=await _next_position(deals_service, stage.id),
+    )
+    deal.business, deal.stage, deal.contact, deal.owner = company, stage, lead, lead.owner or user
+    deal = await deals_service.create(deal)
+    session = deals_service.repository.session
+    session.add(
+        m.DealMessage(
+            deal_id=deal.id,
+            author_id=user.id,
+            kind=m.DealMessageKind.NOTE,
+            body="Moved here from Leads",
+            stage_name=stage.name,
+        )
+    )
+    lead.lead_status = m.LeadStatus.IN_PIPELINE
+    await session.flush()
+    return deal
